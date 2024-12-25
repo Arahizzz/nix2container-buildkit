@@ -25,6 +25,10 @@
       config = {
         Cmd = [ "/bin/bash" ];
       };
+      layers = [(nix2containerPkgs.nix2container.buildLayer {
+        copyToRoot = [ pkgs.gnugrep ];
+        reproducible = false;
+      })];
     };
   };
 }

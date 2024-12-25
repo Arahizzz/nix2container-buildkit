@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/client/llb"
@@ -15,18 +16,31 @@ import (
 	"github.com/pkg/errors"
 )
 
-// Builder contains the Build function we pass to buildkit
-type Builder struct {
+type BuildDelegate struct{}
+
+func New() BuildDelegate {
+	return BuildDelegate{}
 }
 
-// New creates a new builder with the appropriate converter
-func New() Builder {
-	return Builder{}
+// Builder contains the Build function we pass to buildkit
+type Builder struct {
+	ctx context.Context
+	c   client.Client
+	bc  *dockerui.Client
 }
 
 // Build runs the build
-func (b Builder) Build(ctx context.Context, c client.Client) (*client.Result, error) {
-	return BuildWithNix(ctx, c)
+func (b BuildDelegate) Build(ctx context.Context, c client.Client) (*client.Result, error) {
+	bc, err := dockerui.NewClient(c)
+	if err != nil {
+		return nil, err
+	}
+	builder := Builder{
+		ctx: ctx,
+		bc:  bc,
+		c:   c,
+	}
+	return builder.BuildWithNix()
 }
 
 // mimic dockerfile.v1 frontend
@@ -43,54 +57,54 @@ type LayerResult struct {
 	Info  Layer
 }
 
-func BuildWithNix(ctx context.Context, c client.Client) (*client.Result, error) {
-	nixBuilder := GetBuilder(ctx, c)
-	buildResult, err := Nix2ContainerBuild(nixBuilder, ctx, c)
+func (b *Builder) BuildWithNix() (*client.Result, error) {
+	nixBuilder := GetBuilder()
+	buildResult, err := b.Nix2ContainerBuild(nixBuilder)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to run nix2container build")
 	}
-	config, err := ParseNix2ContainerConfig(buildResult, ctx)
+	config, err := b.ParseNix2ContainerConfig(buildResult)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to parse nix2container config")
 	}
-	layersSt, err := ConstructLayers(nixBuilder, buildResult, *config, ctx, c)
+	layersSt, err := b.ConstructLayers(nixBuilder, buildResult, *config)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to construct layers")
 	}
-	finalResult, err := CombineLayers(layersSt, ctx, c)
+	finalResult, err := b.CombineLayers(layersSt)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to combine layers")
 	}
-	image, err := ExportImage(finalResult, *config, ctx, c)
+	image, err := b.ExportImage(finalResult, *config)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to export image")
 	}
 	return image, nil
 }
 
-func GetBuilder(ctx context.Context, c client.Client) llb.State {
+func GetBuilder() llb.State {
 	return llb.Image("nixos/nix:2.24.11").
 		AddEnv("PATH", "/bin:/usr/bin:/nix/var/nix/profiles/default/bin").
 		File(llb.Mkdir("/out", 0755, llb.WithParents(true)))
 }
 
-func GetSelfImage(ctx context.Context, c client.Client) llb.State {
+func GetSelfImage() llb.State {
 	return llb.Image(os.Getenv("BUILDER_TAG"), llb.ResolveDigest(true))
 }
 
-func Nix2ContainerBuild(nixBuilder llb.State, ctx context.Context, c client.Client) (*client.Result, error) {
-	excludePatterns, err := getExcludes(ctx, c)
+func (b *Builder) Nix2ContainerBuild(nixBuilder llb.State) (*client.Result, error) {
+	excludePatterns, err := b.bc.DockerIgnorePatterns(b.ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	localCtxSt := llb.Local(localNameContext,
-		llb.SessionID(c.BuildOpts().SessionID),
+		llb.SessionID(b.c.BuildOpts().SessionID),
 		llb.ExcludePatterns(excludePatterns),
 		dockerui.WithInternalName("local context"),
 	)
 
-	targetName := c.BuildOpts().Opts[keyTargetName]
+	targetName := b.c.BuildOpts().Opts[keyTargetName]
 	flakePath := "."
 	if targetName != "" {
 		flakePath = fmt.Sprintf("%s#%s", flakePath, targetName)
@@ -99,27 +113,26 @@ func Nix2ContainerBuild(nixBuilder llb.State, ctx context.Context, c client.Clie
 	buildSt := nixBuilder.Run(
 		llb.AddMount("/context", localCtxSt),
 		llb.AddMount("/nix", nixBuilder, llb.SourcePath("/nix"), llb.AsPersistentCacheDir("nix2container-buildkit-nix-cache", llb.CacheMountShared)),
-		llb.AddMount("/root/cache", llb.Scratch(), llb.AsPersistentCacheDir("nix2container-buildkit-cache", llb.CacheMountShared)),
 		llb.Dir("/context"),
 		llb.Shlexf("bash -c \"nix -L --extra-experimental-features 'nix-command flakes' build --max-jobs auto --accept-flake-config --option build-users-group '' -o /out/image-link.json %s && cat /out/image-link.json > /out/image.json\"", flakePath),
 		llb.WithCustomNamef("running nix2container build"),
 	)
 
 	// Get build result
-	def, err := buildSt.Marshal(ctx)
+	def, err := buildSt.Marshal(b.ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	buildResult, err := c.Solve(ctx, client.SolveRequest{
+	buildResult, err := b.c.Solve(b.ctx, client.SolveRequest{
 		Definition: def.ToPB(),
 	})
 	return buildResult, err
 }
 
-func ParseNix2ContainerConfig(buildResult *client.Result, ctx context.Context) (config *Nix2ContainerConfig, err error) {
+func (b *Builder) ParseNix2ContainerConfig(buildResult *client.Result) (config *Nix2ContainerConfig, err error) {
 	// Read and parse the image config
-	configBytes, err := buildResult.Ref.ReadFile(ctx, client.ReadRequest{
+	configBytes, err := buildResult.Ref.ReadFile(b.ctx, client.ReadRequest{
 		Filename: "/out/image.json",
 	})
 	if err != nil {
@@ -132,47 +145,40 @@ func ParseNix2ContainerConfig(buildResult *client.Result, ctx context.Context) (
 	return config, nil
 }
 
-func ConstructLayers(nixBuilder llb.State, buildResult *client.Result, config Nix2ContainerConfig, ctx context.Context, c client.Client) ([]LayerResult, error) {
-	buildResultSt, err := buildResult.Ref.ToState()
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert build result to state: %w", err)
-	}
-
-	selfImageSt := GetSelfImage(ctx, c)
+func (b *Builder) ConstructLayers(nixBuilder llb.State, buildResult *client.Result, config Nix2ContainerConfig) ([]LayerResult, error) {
+	selfImageSt := GetSelfImage()
 
 	// Create layersSt for each store path
 	var layersSt []LayerResult
 	for _, layer := range config.Layers {
-		// Construct layer from paths
-		emptyLayer := llb.Scratch().
-			File(llb.Mkdir("/layer/nix/store", 0755, llb.WithParents(true)))
-		constructLayerExec := emptyLayer.
+		layerJsonBytes, err := json.Marshal(layer)
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize layer: %w", err)
+		}
+
+		layerJsonState := llb.Scratch().
+			File(llb.Mkfile("/layer.json", 0644, layerJsonBytes, llb.WithCreatedTime(time.Time{})),
+				llb.WithCustomNamef("preparing manifest for layer %s", layer.Digest))
+
+		// Construct layer by copying paths from cached nix store
+		constructLayerExec := llb.Scratch().
+			File(llb.Mkdir("/nix/store", 0755, llb.WithParents(true), llb.WithCreatedTime(time.Time{}))).
 			Run(
 				llb.AddMount("/src", nixBuilder, llb.AsPersistentCacheDir("nix2container-buildkit-nix-cache", llb.CacheMountShared)),
-				llb.AddMount("/build", buildResultSt),
 				llb.AddMount("/self", selfImageSt),
-				llb.Shlexf("/self/construct-layer --config %s --digest %s --source-prefix %s --dest-prefix %s", "/build/out/image.json", layer.Digest, "/src", "/layer"),
+				llb.AddMount("/build", layerJsonState),
+				llb.Shlexf("/self/construct-layer --config %s --source-prefix %s --dest-prefix %s", "/build/layer.json", "/src", "/"),
 				llb.WithCustomNamef("constructing layer %s", layer.Digest),
-			)
+			).Root()
 
-		constructLayerDef, err := constructLayerExec.Marshal(ctx)
-		if err != nil {
-			return nil, err
-		}
-		constructLayerResult, err := c.Solve(ctx, client.SolveRequest{
-			Definition: constructLayerDef.ToPB(),
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		layerState, err := constructLayerResult.Ref.ToState()
-		if err != nil {
-			return nil, err
-		}
+		constructLayerExec = constructLayerExec.
+			// Remove junk directories after script run, otherwise we lose reproducibility
+			File(llb.Rm("/dev"), dockerui.WithInternalName(fmt.Sprintf("%s: cleaning up /dev", layer.Digest))).
+			File(llb.Rm("/proc"), dockerui.WithInternalName(fmt.Sprintf("%s: cleaning up /proc", layer.Digest))).
+			File(llb.Rm("/sys"), dockerui.WithInternalName(fmt.Sprintf("%s: cleaning up /sys", layer.Digest)))
 
 		layersSt = append(layersSt, LayerResult{
-			State: layerState,
+			State: constructLayerExec.Reset(llb.Scratch()),
 			Info:  layer,
 		})
 	}
@@ -180,24 +186,33 @@ func ConstructLayers(nixBuilder llb.State, buildResult *client.Result, config Ni
 	return layersSt, nil
 }
 
-func CombineLayers(layers []LayerResult, ctx context.Context, c client.Client) (*client.Result, error) {
-	// Create final state by copying layers
-	finalState := llb.Scratch()
-	for _, layer := range layers {
-		finalState = finalState.File(
-			llb.Copy(layer.State, "/layer", "/", &llb.CopyInfo{
-				CopyDirContentsOnly: true,
-			}),
-			llb.WithCustomNamef("copy layer %s", layer.Info.Digest),
-		)
+func (b *Builder) CombineLayers(layers []LayerResult) (*client.Result, error) {
+	var finalState llb.State
+	if IsMergeSupported(b.c) {
+		states := []llb.State{}
+		for _, layer := range layers {
+			states = append(states, layer.State)
+		}
+		finalState = llb.Merge(states)
+	} else {
+		// Create final state by copying layers
+		finalState = llb.Scratch()
+		for _, layer := range layers {
+			finalState = finalState.File(
+				llb.Copy(layer.State, "/", "/", &llb.CopyInfo{
+					CopyDirContentsOnly: true,
+				}),
+				llb.WithCustomNamef("copy layer %s", layer.Info.Digest),
+			)
+		}
 	}
 
 	// Create final result
-	finalDef, err := finalState.Marshal(ctx)
+	finalDef, err := finalState.Marshal(b.ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to marshal final state")
 	}
-	finalResult, err := c.Solve(ctx, client.SolveRequest{
+	finalResult, err := b.c.Solve(b.ctx, client.SolveRequest{
 		Definition: finalDef.ToPB(),
 	})
 	if err != nil {
@@ -207,7 +222,7 @@ func CombineLayers(layers []LayerResult, ctx context.Context, c client.Client) (
 	return finalResult, nil
 }
 
-func ExportImage(finalResult *client.Result, config Nix2ContainerConfig, ctx context.Context, c client.Client) (*client.Result, error) {
+func (b *Builder) ExportImage(finalResult *client.Result, config Nix2ContainerConfig) (*client.Result, error) {
 	res := client.NewResult()
 	ref, err := finalResult.SingleRef()
 	if err != nil {

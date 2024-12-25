@@ -15,9 +15,8 @@ import (
 
 var (
 	configFlag = flag.String("config", "", "path to image config file")
-	digestFlag = flag.String("digest", "", "digest of the layer to construct")
-	srcPrefix  = flag.String("source-prefix", "", "prefix to add to paths")
-	destPrefix = flag.String("dest-prefix", "", "prefix to add to paths")
+	srcPrefix  = flag.String("source-prefix", "", "source root prefix")
+	destPrefix = flag.String("dest-prefix", "", "destination root prefix")
 )
 
 func main() {
@@ -32,10 +31,6 @@ func runCommand() error {
 
 	if configFlag == nil || *configFlag == "" {
 		return errors.New("config flag is required")
-	}
-
-	if digestFlag == nil || *digestFlag == "" {
-		return errors.New("digest flag is required")
 	}
 
 	if srcPrefix == nil || *srcPrefix == "" {
@@ -53,30 +48,32 @@ func runCommand() error {
 		return err
 	}
 
-	return constructLayer(config)
+	return constructLayer(*config)
 }
 
-func loadConfig(path string) (*build.Nix2ContainerConfig, error) {
+func loadConfig(path string) (*build.Layer, error) {
 	logrus.Infof("loading config from %s", path)
 	buff, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
-	config := &build.Nix2ContainerConfig{}
+	config := &build.Layer{}
 	err = json.Unmarshal(buff, config)
 	return config, err
 }
 
-func constructLayer(config *build.Nix2ContainerConfig) error {
-	logrus.Infof("constructing layer %s", *digestFlag)
-	var layer build.Layer
-	for _, l := range config.Layers {
-		if l.Digest == *digestFlag {
-			layer = l
-		}
-	}
+func constructLayer(layer build.Layer) error {
+	logrus.Infof("constructing layer %s", layer.Digest)
 
+	if layer.LayerPath == nil {
+		return copyLayerPaths(layer)
+	} else {
+		return unpackLayer(layer)
+	}
+}
+
+func copyLayerPaths(layer build.Layer) error {
 	for _, path := range layer.Paths {
 		srcPath := *srcPrefix + path.Path
 		destPath := *destPrefix + path.Path
@@ -96,6 +93,23 @@ func constructLayer(config *build.Nix2ContainerConfig) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+func unpackLayer(layer build.Layer) error {
+	srcPath := *srcPrefix + *layer.LayerPath
+	destPath := *destPrefix
+
+	logrus.Infof("unpacking %s to %s", srcPath, destPath)
+	cmdStr := fmt.Sprintf("/self/bin/tar -xf %[1]s -C %[2]s", srcPath, destPath)
+	cmd := exec.Command("/self/bin/sh", "-c", cmdStr)
+	out, err := cmd.CombinedOutput()
+	logrus.Infof("%s", string(out))
+
+	if err != nil {
+		return err
 	}
 
 	return nil

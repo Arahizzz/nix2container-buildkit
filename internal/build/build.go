@@ -149,7 +149,7 @@ func (b *Builder) ConstructLayers(nixBuilder llb.State, buildResult *client.Resu
 	selfImageSt := GetSelfImage()
 
 	// Create layersSt for each store path
-	var layersSt []LayerResult
+	var layers []LayerResult
 	for _, layer := range config.Layers {
 		layerJsonBytes, err := json.Marshal(layer)
 		if err != nil {
@@ -158,48 +158,54 @@ func (b *Builder) ConstructLayers(nixBuilder llb.State, buildResult *client.Resu
 
 		layerJsonState := llb.Scratch().
 			File(llb.Mkfile("/layer.json", 0644, layerJsonBytes, llb.WithCreatedTime(time.Time{})),
-				llb.WithCustomNamef("preparing manifest for layer %s", layer.Digest))
+				dockerui.WithInternalName(fmt.Sprintf("%s: preparing manifest", layer.Digest)))
 
 		// Construct layer by copying paths from cached nix store
-		constructLayerExec := llb.Scratch().
-			File(llb.Mkdir("/nix/store", 0755, llb.WithParents(true), llb.WithCreatedTime(time.Time{}))).
+		layerSt := llb.Scratch().
+			File(llb.Mkdir("/layer/nix/store", 0755, llb.WithParents(true), llb.WithCreatedTime(time.Time{})),
+				dockerui.WithInternalName("layer base")).
 			Run(
 				llb.AddMount("/src", nixBuilder, llb.AsPersistentCacheDir("nix2container-buildkit-nix-cache", llb.CacheMountShared)),
 				llb.AddMount("/self", selfImageSt),
 				llb.AddMount("/build", layerJsonState),
-				llb.Shlexf("/self/construct-layer --config %s --source-prefix %s --dest-prefix %s", "/build/layer.json", "/src", "/"),
-				llb.WithCustomNamef("constructing layer %s", layer.Digest),
+				llb.Shlexf("/self/construct-layer --config %s --source-prefix %s --dest-prefix %s", "/build/layer.json", "/src", "/layer"),
+				dockerui.WithInternalName(fmt.Sprintf("%s: constructing layer", layer.Digest)),
 			).Root()
 
-		constructLayerExec = constructLayerExec.
-			// Remove junk directories after script run, otherwise we lose reproducibility
-			File(llb.Rm("/dev"), dockerui.WithInternalName(fmt.Sprintf("%s: cleaning up /dev", layer.Digest))).
-			File(llb.Rm("/proc"), dockerui.WithInternalName(fmt.Sprintf("%s: cleaning up /proc", layer.Digest))).
-			File(llb.Rm("/sys"), dockerui.WithInternalName(fmt.Sprintf("%s: cleaning up /sys", layer.Digest)))
+		if IsMergeSupported(b.c) {
+			// Rebase /layer as new root to enable efficient merge later
+			// For copy based strategy there is no need to do this as it's just extra copy
+			layerSt = llb.Scratch().
+				File(llb.Copy(layerSt, "/layer", "/", &llb.CopyInfo{
+					CopyDirContentsOnly: true,
+				}), dockerui.WithInternalName(fmt.Sprintf("%s: storing layer", layer.Digest)))
+		}
 
-		layersSt = append(layersSt, LayerResult{
-			State: constructLayerExec.Reset(llb.Scratch()),
+		layers = append(layers, LayerResult{
+			State: layerSt,
 			Info:  layer,
 		})
 	}
 
-	return layersSt, nil
+	return layers, nil
 }
 
 func (b *Builder) CombineLayers(layers []LayerResult) (*client.Result, error) {
 	var finalState llb.State
 	if IsMergeSupported(b.c) {
+		// Create final state by merging layers together
 		states := []llb.State{}
 		for _, layer := range layers {
 			states = append(states, layer.State)
 		}
 		finalState = llb.Merge(states)
 	} else {
-		// Create final state by copying layers
+		// Create final state by copying layers on top of each other
 		finalState = llb.Scratch()
 		for _, layer := range layers {
+			// Copy /layer contents into final image
 			finalState = finalState.File(
-				llb.Copy(layer.State, "/", "/", &llb.CopyInfo{
+				llb.Copy(layer.State, "/layer", "/", &llb.CopyInfo{
 					CopyDirContentsOnly: true,
 				}),
 				llb.WithCustomNamef("copy layer %s", layer.Info.Digest),

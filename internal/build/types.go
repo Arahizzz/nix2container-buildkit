@@ -4,6 +4,7 @@ import (
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
+// Definition of JSON config produced by nix2container
 type Nix2ContainerConfig struct {
 	Version     int               `json:"version"`
 	ImageConfig specs.ImageConfig `json:"image-config"`

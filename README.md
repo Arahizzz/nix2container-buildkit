@@ -1,44 +1,28 @@
-# buildkit-frontend-template
+# nix2container-buildkit
 
-A basic BuildKit frontend template.
+Custom BuildKit frontend that allows to build [nix2container](https://github.com/nlewo/nix2container) images
+using native Docker tooling.
 
-## Getting started
+## Features
+* Multi-layer builds
+* Caching of nix store for faster incremental rebuilds
+* Separate caching of each layer
+* Support of [LLB merge operation](https://www.docker.com/blog/mergediff-building-dags-more-efficiently-and-elegantly/) to prevent needless layer rebuilds. You must enable [containerd image store](https://docs.docker.com/desktop/features/containerd/) otherwise it will fallback onto simple layer copying.
 
-Get the repo:
-
-```bash
-$ git clone https://github.com:arahizzz/nix2container-buildkit.git
-$ cd buildkit-frontend-template
+## Usage
+Simply add to the top of your flake.nix:
+```nix
+# syntax = docker.io/arahizzz/nix2container-buildkit:0.1.0
 ```
+See [example of flake.nix](examples/flake/flake.nix).
 
-Rename the template to your frontend name of choice, by replacing all instances
-of `arahizzz/nix2container-buildkit` with your frontend name:
-
+You can now build image using the usual Docker commands:
 ```bash
-$ find . \( ! -regex '.*/\..*' \) -type f -exec sed -i 's/jedevc\/buildkit-frontend-template/your-username\/your-frontend-name/g' {} +
+docker build -f flake.nix .
 ```
+__Note:__ `flake.nix` must be present at the root of the build context.
 
-## Build the frontend
-
-To build and push the frontend:
-
+You can also specify custom flake target, if needed:
 ```bash
-$ make deploy DEST=docker.io/your-username/your-frontend-name
-```
-
-## Running the examples
-
-To setup and run the examples locally, you need a version of BuildKit with
-https://github.com/moby/buildkit/pull/3633 - you may need to build this
-yourself.
-
-```bash
-$ BUILDX_BUILDER=dev make example EXAMPLE=basic
-$ docker image inspect example-basic
-[
-    {
-        "Id": "sha256:79dea169968780bf07791667b1131b774339c15f6b29c70364ec715741076f3f",
-        ...
-    }
-]
+docker build -f flake.nix --target package.x86_64-linux.customTarget .
 ```

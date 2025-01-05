@@ -1,5 +1,9 @@
 package main
 
+/**
+ * Utility script to construct based on it's JSON definition by copying files from nix cache into layer storage
+ */
+
 import (
 	"encoding/json"
 	"errors"
@@ -79,8 +83,10 @@ func copyLayerPaths(layer build.Layer) error {
 		destPath := *destPrefix + path.Path
 
 		if path.Options != nil && path.Options.Rewrite != nil {
+			// If the rewrite option is set, adjust the destination path using the regex
 			destPath = *destPrefix + regexp.MustCompile(path.Options.Rewrite.Regex).
 				ReplaceAllString(path.Path, path.Options.Rewrite.Repl)
+		    // Fixup src path, otherwise copy will end up incorrect
 			srcPath = srcPath + "/*"
 		}
 
@@ -98,6 +104,7 @@ func copyLayerPaths(layer build.Layer) error {
 	return nil
 }
 
+// Unpack non-reproducible layer from tar archive into destination
 func unpackLayer(layer build.Layer) error {
 	srcPath := *srcPrefix + *layer.LayerPath
 	destPath := *destPrefix

@@ -22,14 +22,13 @@ func New() BuildDelegate {
 	return BuildDelegate{}
 }
 
-// Builder contains the Build function we pass to buildkit
 type Builder struct {
 	ctx context.Context
 	c   client.Client
 	bc  *dockerui.Client
 }
 
-// Build runs the build
+// Buildkit Entrypoint
 func (b BuildDelegate) Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	bc, err := dockerui.NewClient(c)
 	if err != nil {
@@ -43,7 +42,6 @@ func (b BuildDelegate) Build(ctx context.Context, c client.Client) (*client.Resu
 	return builder.BuildWithNix()
 }
 
-// mimic dockerfile.v1 frontend
 const (
 	localNameContext     = "context"
 	localNameDockerfile  = "dockerfile"
@@ -82,39 +80,51 @@ func (b *Builder) BuildWithNix() (*client.Result, error) {
 	return image, nil
 }
 
+// Get nix builder
 func GetBuilder() llb.State {
 	return llb.Image("nixos/nix:2.24.11").
 		AddEnv("PATH", "/bin:/usr/bin:/nix/var/nix/profiles/default/bin").
 		File(llb.Mkdir("/out", 0755, llb.WithParents(true)))
 }
 
+// Recursively load this image to be able to mount and get access to util binaries
 func GetSelfImage() llb.State {
 	return llb.Image(os.Getenv("BUILDER_TAG"), llb.ResolveDigest(true))
 }
 
+// Run nix2container build with mounted nix store cache
 func (b *Builder) Nix2ContainerBuild(nixBuilder llb.State) (*client.Result, error) {
+	// Parse .dockerignore
 	excludePatterns, err := b.bc.DockerIgnorePatterns(b.ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	// Build context
 	localCtxSt := llb.Local(localNameContext,
 		llb.SessionID(b.c.BuildOpts().SessionID),
 		llb.ExcludePatterns(excludePatterns),
 		dockerui.WithInternalName("local context"),
 	)
 
+	// Check if flake target is specified
 	targetName := b.c.BuildOpts().Opts[keyTargetName]
 	flakePath := "."
 	if targetName != "" {
+		// Append target to flake path
 		flakePath = fmt.Sprintf("%s#%s", flakePath, targetName)
 	}
 
+	// Build using nix2container
 	buildSt := nixBuilder.Run(
 		llb.AddMount("/context", localCtxSt),
+		// Cache nix store to speed future rebuilds
 		llb.AddMount("/nix", nixBuilder, llb.SourcePath("/nix"), llb.AsPersistentCacheDir("nix2container-buildkit-nix-cache", llb.CacheMountShared)),
 		llb.Dir("/context"),
-		llb.Shlexf("bash -c \"nix -L --extra-experimental-features 'nix-command flakes' build --max-jobs auto --accept-flake-config --option build-users-group '' -o /out/image-link.json %s && cat /out/image-link.json > /out/image.json\"", flakePath),
+		llb.Shlexf("bash -c \"nix -L --extra-experimental-features 'nix-command flakes'" + 
+			" build --max-jobs auto --accept-flake-config --option build-users-group '' -o /out/image-link.json %s" +
+			// Read symlink into actual file, otherwise unreadable without mounted cache
+			" && cat /out/image-link.json > /out/image.json\"", flakePath),
 		llb.WithCustomNamef("running nix2container build"),
 	)
 
@@ -130,8 +140,8 @@ func (b *Builder) Nix2ContainerBuild(nixBuilder llb.State) (*client.Result, erro
 	return buildResult, err
 }
 
+// Read and parse the image config from the json output
 func (b *Builder) ParseNix2ContainerConfig(buildResult *client.Result) (config *Nix2ContainerConfig, err error) {
-	// Read and parse the image config
 	configBytes, err := buildResult.Ref.ReadFile(b.ctx, client.ReadRequest{
 		Filename: "/out/image.json",
 	})
@@ -145,6 +155,7 @@ func (b *Builder) ParseNix2ContainerConfig(buildResult *client.Result) (config *
 	return config, nil
 }
 
+// Construct each layer by copying paths from cached nix store
 func (b *Builder) ConstructLayers(nixBuilder llb.State, buildResult *client.Result, config Nix2ContainerConfig) ([]LayerResult, error) {
 	selfImageSt := GetSelfImage()
 
@@ -156,6 +167,7 @@ func (b *Builder) ConstructLayers(nixBuilder llb.State, buildResult *client.Resu
 			return nil, fmt.Errorf("failed to serialize layer: %w", err)
 		}
 
+		// Write layer definition into json input
 		layerJsonState := llb.Scratch().
 			File(llb.Mkfile("/layer.json", 0644, layerJsonBytes, llb.WithCreatedTime(time.Time{})),
 				dockerui.WithInternalName(fmt.Sprintf("%s: preparing manifest", layer.Digest)))
@@ -165,15 +177,18 @@ func (b *Builder) ConstructLayers(nixBuilder llb.State, buildResult *client.Resu
 			File(llb.Mkdir("/layer/nix/store", 0755, llb.WithParents(true), llb.WithCreatedTime(time.Time{})),
 				dockerui.WithInternalName("layer base")).
 			Run(
+				// Mount nix store cache
 				llb.AddMount("/src", nixBuilder, llb.AsPersistentCacheDir("nix2container-buildkit-nix-cache", llb.CacheMountShared)),
+				// Mount self image with util binaries
 				llb.AddMount("/self", selfImageSt),
+				// Mount layer definition
 				llb.AddMount("/build", layerJsonState),
 				llb.Shlexf("/self/construct-layer --config %s --source-prefix %s --dest-prefix %s", "/build/layer.json", "/src", "/layer"),
 				dockerui.WithInternalName(fmt.Sprintf("%s: constructing layer", layer.Digest)),
 			).Root()
 
 		if IsMergeSupported(b.c) {
-			// Rebase /layer as new root to enable efficient merge later
+			// Rebase /layer as new root / to enable efficient merge later
 			// For copy based strategy there is no need to do this as it's just extra copy
 			layerSt = llb.Scratch().
 				File(llb.Copy(layerSt, "/layer", "/", &llb.CopyInfo{
@@ -190,6 +205,7 @@ func (b *Builder) ConstructLayers(nixBuilder llb.State, buildResult *client.Resu
 	return layers, nil
 }
 
+// Combine layers into final image state
 func (b *Builder) CombineLayers(layers []LayerResult) (*client.Result, error) {
 	var finalState llb.State
 	if IsMergeSupported(b.c) {
